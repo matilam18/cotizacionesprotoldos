@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="es-CL">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#12344d">
+<title>Cotizador ProToldos</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2312344d'/%3E%3Cpath d='M5 14 16 7l11 7v2H5z' fill='%23f2a33a'/%3E%3Cpath d='M8 17h16v8H8z' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<!-- ============ ACCESO ============ -->
+<section id="auth" class="auth" hidden>
+  <div class="auth-card">
+    <div class="auth-logo" id="authLogo"><img src="/logo-protoldos.png" alt="ProToldos"></div>
+    <p class="auth-sub" id="authSub">Cotizador privado</p>
+
+    <form id="loginForm" autocomplete="off">
+      <label class="lbl" for="loginName">Nombre</label>
+      <input id="loginName" class="inp" autocomplete="username" autocapitalize="words" maxlength="40" required>
+      <label class="lbl">Código</label>
+      <div class="pin-dots" id="loginDots" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <input id="loginPin" class="pin-hidden" inputmode="numeric" pattern="\d{4}" maxlength="4" autocomplete="current-password" aria-label="Código de 4 números">
+      <div class="keypad" data-target="loginPin"></div>
+      <p class="msg" id="loginMsg" role="alert"></p>
+    </form>
+
+    <form id="setupForm" hidden autocomplete="off">
+      <p class="setup-note">Primera vez: crea tu cuenta. Necesitas la <b>clave de instalación</b> que pusiste en Cloudflare (SETUP_KEY).</p>
+      <label class="lbl" for="setupName">Tu nombre</label>
+      <input id="setupName" class="inp" maxlength="40" required>
+      <label class="lbl" for="setupPin">Código de 4 números</label>
+      <input id="setupPin" class="inp" inputmode="numeric" pattern="\d{4}" maxlength="4" type="password" required>
+      <label class="lbl" for="setupPin2">Repite el código</label>
+      <input id="setupPin2" class="inp" inputmode="numeric" pattern="\d{4}" maxlength="4" type="password" required>
+      <label class="lbl" for="setupKey">Clave de instalación</label>
+      <input id="setupKey" class="inp" type="password" required>
+      <button class="btn primary wide" type="submit">Crear cuenta</button>
+      <p class="msg" id="setupMsg" role="alert"></p>
+    </form>
+  </div>
+</section>
+
+<!-- ============ APP ============ -->
+<div id="app" hidden>
+  <header class="top">
+    <div class="brand"><img id="topLogo" alt="" hidden><span id="topName">ProToldos</span></div>
+    <nav class="tabs" role="tablist">
+      <button data-view="editor" class="on">Nueva</button>
+      <button data-view="list">Guardadas</button>
+      <button data-view="settings">Ajustes</button>
+    </nav>
+    <button class="btn ghost sm" id="logoutBtn" title="Salir">Salir</button>
+  </header>
+
+  <!-- ---------- EDITOR ---------- -->
+  <main id="view-editor" class="view">
+    <div class="ed-head">
+      <h1 id="edTitle">Nueva cotización</h1>
+      <span class="badge" id="edBadge" hidden></span>
+    </div>
+
+    <section class="card">
+      <h2>Cliente</h2>
+      <div class="grid g3">
+        <div class="f span2"><label class="lbl" for="cCompany">Empresa / cliente</label><input id="cCompany" class="inp" maxlength="150" placeholder="Nombre de la empresa"></div>
+        <div class="f"><label class="lbl" for="cRut">RUT</label><input id="cRut" class="inp" maxlength="20" placeholder="12.345.678-9"></div>
+        <div class="f"><label class="lbl" for="cContact">Contacto</label><input id="cContact" class="inp" maxlength="150"></div>
+        <div class="f"><label class="lbl" for="cPhone">Teléfono</label><input id="cPhone" class="inp" maxlength="40" inputmode="tel"></div>
+        <div class="f"><label class="lbl" for="cEmail">Correo</label><input id="cEmail" class="inp" maxlength="150" inputmode="email"></div>
+        <div class="f span2"><label class="lbl" for="cAddress">Dirección / comuna</label><input id="cAddress" class="inp" maxlength="300"></div>
+        <div class="f"><label class="lbl" for="qDate">Fecha</label><input id="qDate" class="inp" type="date"></div>
+        <div class="f"><label class="lbl" for="qValid">Validez (días)</label><input id="qValid" class="inp" type="number" min="1" max="365" value="15"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="row-between"><h2>Productos</h2><span class="hint">Precio unitario <b>sin IVA</b></span></div>
+      <div class="items-head" aria-hidden="true">
+        <span>Cant.</span><span>Descripción</span><span>Precio unit.</span><span>Neto</span><span>IVA</span><span>Total</span><span></span>
+      </div>
+      <div id="items"></div>
+      <button class="btn line" id="addItem" type="button">+ Agregar fila</button>
+    </section>
+
+    <div class="two">
+      <section class="card">
+        <h2>Imagen del proyecto</h2>
+        <p class="hint">Cómo va a quedar el toldo. Solo se guarda dentro del PDF.</p>
+        <div class="drop" id="imgDrop" tabindex="0" role="button" aria-label="Subir imagen del proyecto">
+          <img id="imgPreview" alt="" hidden>
+          <div class="drop-empty" id="imgEmpty"><b>Subir imagen</b><span>Toca o arrastra aquí (JPG o PNG)</span></div>
+        </div>
+        <input type="file" id="imgFile" accept="image/*" hidden>
+        <div class="row gap"><button class="btn line sm" id="imgChange" type="button">Cambiar</button><button class="btn line sm danger" id="imgRemove" type="button" hidden>Quitar imagen</button></div>
+        <p class="hint warn" id="imgNote" hidden>Esta cotización guardada ya tiene su imagen dentro del PDF. Si la editas y guardas sin volver a subirla, el PDF nuevo queda <b>sin imagen</b>.</p>
+      </section>
+
+      <section class="card totals-card">
+        <h2>Descuento y totales</h2>
+        <div class="disc">
+          <label class="lbl" for="discValue">Descuento</label>
+          <div class="disc-row">
+            <input id="discValue" class="inp" type="number" min="0" step="any" value="0" inputmode="decimal">
+            <div class="seg" role="group" aria-label="Tipo de descuento">
+              <button type="button" data-dt="pct" class="on">%</button>
+              <button type="button" data-dt="amt">$</button>
+            </div>
+          </div>
+        </div>
+        <dl class="tot">
+          <div><dt>Subtotal neto</dt><dd id="tSub">$0</dd></div>
+          <div class="disc-line"><dt id="tDiscLbl">Descuento</dt><dd id="tDisc">−$0</dd></div>
+          <div><dt>Neto</dt><dd id="tNet">$0</dd></div>
+          <div><dt id="tIvaLbl">IVA 19%</dt><dd id="tIva">$0</dd></div>
+          <div class="grand"><dt>Total</dt><dd id="tTotal">$0</dd></div>
+        </dl>
+      </section>
+    </div>
+
+    <section class="card">
+      <h2>Observaciones</h2>
+      <textarea id="qNotes" class="inp" rows="4" maxlength="4000" placeholder="Plazo de instalación, forma de pago, garantía…"></textarea>
+    </section>
+
+    <div class="actions">
+      <button class="btn line" id="newBtn" type="button">Nueva</button>
+      <button class="btn line" id="previewBtn" type="button">Ver PDF</button>
+      <button class="btn line" id="printBtn" type="button">Imprimir</button>
+      <button class="btn primary" id="saveBtn" type="button">Guardar</button>
+    </div>
+  </main>
+
+  <!-- ---------- LISTA ---------- -->
+  <main id="view-list" class="view" hidden>
+    <div class="ed-head"><h1>Cotizaciones guardadas</h1></div>
+    <input id="search" class="inp search" type="search" placeholder="Buscar por empresa, contacto, RUT o N°" autocomplete="off">
+    <div id="list" class="list"></div>
+  </main>
+
+  <!-- ---------- AJUSTES ---------- -->
+  <main id="view-settings" class="view" hidden>
+    <div class="ed-head"><h1 id="setTitle">Ajustes</h1></div>
+    <p class="welcome" id="welcomeNote" hidden>Antes de tu primera cotización, completa los datos de ProToldos. Salen en el encabezado de cada PDF y los puedes cambiar cuando quieras en <b>Ajustes</b>.</p>
+
+    <section class="card">
+      <h2>Logo</h2>
+      <p class="hint">Ya viene el logo de ProToldos. Toca el recuadro solo si quieres cambiarlo.</p>
+      <div class="logo-box">
+        <div class="drop small" id="logoDrop" tabindex="0" role="button" aria-label="Subir logo">
+          <img id="logoPreview" alt="" hidden>
+          <div class="drop-empty" id="logoEmpty"><b>Subir logo</b><span>PNG con fondo transparente queda mejor</span></div>
+        </div>
+        <input type="file" id="logoFile" accept="image/png,image/jpeg,image/webp" hidden>
+        <button class="btn line sm danger" id="logoRemove" type="button" hidden>Volver al logo de ProToldos</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Datos comerciales</h2>
+      <p class="hint">Aparecen en el encabezado de cada cotización.</p>
+      <div class="grid g2">
+        <div class="f"><label class="lbl" for="sTrade">Nombre de fantasía</label><input id="sTrade" class="inp" maxlength="100"></div>
+        <div class="f"><label class="lbl" for="sLegal">Razón social</label><input id="sLegal" class="inp" maxlength="150"></div>
+        <div class="f"><label class="lbl" for="sRut">RUT</label><input id="sRut" class="inp" maxlength="20"></div>
+        <div class="f"><label class="lbl" for="sGiro">Giro</label><input id="sGiro" class="inp" maxlength="200"></div>
+        <div class="f span2"><label class="lbl" for="sAddress">Dirección</label><input id="sAddress" class="inp" maxlength="300"></div>
+        <div class="f"><label class="lbl" for="sPhone">Teléfono / WhatsApp</label><input id="sPhone" class="inp" maxlength="60"></div>
+        <div class="f"><label class="lbl" for="sEmail">Correo</label><input id="sEmail" class="inp" maxlength="150"></div>
+        <div class="f"><label class="lbl" for="sWeb">Sitio web</label><input id="sWeb" class="inp" maxlength="150"></div>
+        <div class="f"><label class="lbl" for="sSeller">Vendedor / atendido por</label><input id="sSeller" class="inp" maxlength="100"></div>
+        <div class="f span2"><label class="lbl" for="sBank">Datos para transferencia (para tu referencia; no salen en la cotización)</label><textarea id="sBank" class="inp" rows="3" maxlength="1000"></textarea></div>
+        <div class="f span2"><label class="lbl" for="sCond">Condiciones por defecto (se copian en Observaciones al crear una cotización)</label><textarea id="sCond" class="inp" rows="4" maxlength="3000"></textarea></div>
+        <div class="f"><label class="lbl" for="sIva">IVA (%)</label><input id="sIva" class="inp" type="number" min="0" max="100" step="any"></div>
+        <div class="f"><label class="lbl" for="sValid">Validez por defecto (días)</label><input id="sValid" class="inp" type="number" min="1" max="365"></div>
+      </div>
+      <div class="row end"><button class="btn primary" id="saveSettings" type="button">Guardar ajustes</button></div>
+    </section>
+
+    <section class="card" id="pinCard">
+      <h2>Mi código</h2>
+      <div class="grid g3">
+        <div class="f"><label class="lbl" for="pinCur">Código actual</label><input id="pinCur" class="inp" type="password" inputmode="numeric" maxlength="4"></div>
+        <div class="f"><label class="lbl" for="pinNew">Código nuevo</label><input id="pinNew" class="inp" type="password" inputmode="numeric" maxlength="4"></div>
+        <div class="f"><label class="lbl" for="pinNew2">Repite el nuevo</label><input id="pinNew2" class="inp" type="password" inputmode="numeric" maxlength="4"></div>
+      </div>
+      <div class="row end"><button class="btn line" id="changePin" type="button">Cambiar código</button></div>
+    </section>
+
+    <section class="card" id="usersCard">
+      <h2>Cuentas con acceso</h2>
+      <div id="users" class="users"></div>
+      <div class="grid g3">
+        <div class="f"><label class="lbl" for="uName">Nombre</label><input id="uName" class="inp" maxlength="40"></div>
+        <div class="f"><label class="lbl" for="uPin">Código de 4 números</label><input id="uPin" class="inp" type="password" inputmode="numeric" maxlength="4"></div>
+        <div class="f end-f"><button class="btn line wide" id="addUser" type="button">Agregar cuenta</button></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<div class="modal" id="pdfModal" hidden>
+  <div class="modal-box">
+    <div class="modal-bar">
+      <b id="pdfTitle">PDF</b>
+      <div class="row gap"><a class="btn line sm" id="pdfDownload" download>Descargar</a><button class="btn line sm" id="pdfOpen" type="button">Abrir</button><button class="btn ghost sm" id="pdfClose" type="button">Cerrar</button></div>
+    </div>
+    <iframe id="pdfFrame" title="Vista del PDF"></iframe>
+  </div>
+</div>
+
+<script src="/vendor/jspdf.umd.min.js"></script>
+<script src="/vendor/jspdf.plugin.autotable.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

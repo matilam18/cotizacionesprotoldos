@@ -1,0 +1,444 @@
+// Cotizador ProToldos — servidor (Cloudflare Pages, modo avanzado con _worker.js)
+// Necesita en el proyecto de Pages:
+//   - Binding D1 llamado DB
+//   - Variable secreta SETUP_KEY (clave para crear la primera cuenta)
+
+const IVA_DEFAULT = 19;
+const SESSION_DAYS = 30;
+const MAX_PDF = 1_900_000;        // D1 admite filas de hasta 2 MB
+const MAX_JSON = 1_200_000;       // ajustes incluyen el logo comprimido
+const PBKDF2_ITER = 100_000;      // máximo permitido por Workers
+
+const SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS users (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+     pin_hash TEXT NOT NULL,
+     salt TEXT NOT NULL,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS sessions (
+     token_hash TEXT PRIMARY KEY,
+     user_id INTEGER NOT NULL,
+     expires_at INTEGER NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS login_attempts (
+     k TEXT PRIMARY KEY,
+     fails INTEGER NOT NULL DEFAULT 0,
+     locked_until INTEGER NOT NULL DEFAULT 0)`,
+  `CREATE TABLE IF NOT EXISTS settings (
+     k TEXT PRIMARY KEY,
+     v TEXT NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS quotes (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     number INTEGER NOT NULL UNIQUE,
+     client_company TEXT NOT NULL DEFAULT '',
+     client_contact TEXT NOT NULL DEFAULT '',
+     client_rut TEXT NOT NULL DEFAULT '',
+     client_phone TEXT NOT NULL DEFAULT '',
+     client_email TEXT NOT NULL DEFAULT '',
+     client_address TEXT NOT NULL DEFAULT '',
+     quote_date TEXT NOT NULL,
+     valid_days INTEGER NOT NULL DEFAULT 15,
+     items_json TEXT NOT NULL,
+     discount_type TEXT NOT NULL DEFAULT 'pct',
+     discount_value REAL NOT NULL DEFAULT 0,
+     iva_rate REAL NOT NULL DEFAULT 19,
+     notes TEXT NOT NULL DEFAULT '',
+     subtotal INTEGER NOT NULL DEFAULT 0,
+     discount_amount INTEGER NOT NULL DEFAULT 0,
+     net INTEGER NOT NULL DEFAULT 0,
+     iva INTEGER NOT NULL DEFAULT 0,
+     total INTEGER NOT NULL DEFAULT 0,
+     pdf BLOB,
+     pdf_size INTEGER NOT NULL DEFAULT 0,
+     created_by INTEGER,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')),
+     updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE INDEX IF NOT EXISTS idx_quotes_company ON quotes(client_company COLLATE NOCASE)`,
+];
+
+let schemaReady = false;
+async function ensureSchema(db) {
+  if (schemaReady) return;
+  await db.batch(SCHEMA.map((s) => db.prepare(s)));
+  schemaReady = true;
+}
+
+// ---------- utilidades ----------
+const enc = new TextEncoder();
+const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+const randomHex = (n) => hex(crypto.getRandomValues(new Uint8Array(n)));
+
+async function hashPin(pin, saltHex) {
+  const key = await crypto.subtle.importKey('raw', enc.encode(pin), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode(saltHex), iterations: PBKDF2_ITER }, key, 256);
+  return b64(bits);
+}
+async function sha256(s) { return hex(await crypto.subtle.digest('SHA-256', enc.encode(s))); }
+
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+
+const SEC_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer',
+  'X-Robots-Tag': 'noindex, nofollow',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  'Strict-Transport-Security': 'max-age=31536000',
+  'Content-Security-Policy':
+    "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; " +
+    "connect-src 'self'; frame-src 'self' blob:; object-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+};
+
+function json(data, status = 200, extra = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...SEC_HEADERS, ...extra },
+  });
+}
+const err = (msg, status = 400) => json({ error: msg }, status);
+
+function withSec(res) {
+  const r = new Response(res.body, res);
+  for (const [k, v] of Object.entries(SEC_HEADERS)) r.headers.set(k, v);
+  return r;
+}
+
+function cookie(req, name) {
+  const c = req.headers.get('Cookie') || '';
+  const m = c.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)'));
+  return m ? m[1] : null;
+}
+function sessionCookie(token, maxAge) {
+  return `cot_s=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
+}
+
+const str = (v, max = 300) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+const validPin = (p) => typeof p === 'string' && /^\d{4}$/.test(p);
+const validName = (n) => typeof n === 'string' && n.trim().length >= 2 && n.trim().length <= 40;
+
+// Mismo cálculo que en el navegador: precios unitarios netos, IVA sobre el neto con descuento.
+function computeTotals(items, discountType, discountValue, ivaRate) {
+  const subtotal = items.reduce((s, it) => s + Math.round(num(it.qty) * num(it.price)), 0);
+  let discount = discountType === 'amt'
+    ? Math.round(num(discountValue))
+    : Math.round(subtotal * Math.min(Math.max(num(discountValue), 0), 100) / 100);
+  discount = Math.min(Math.max(discount, 0), subtotal);
+  const net = subtotal - discount;
+  const iva = Math.round(net * ivaRate / 100);
+  return { subtotal, discount, net, iva, total: net + iva };
+}
+
+function sanitizeQuote(b) {
+  const items = (Array.isArray(b.items) ? b.items : []).slice(0, 200).map((it) => ({
+    qty: Math.max(0, num(it.qty)),
+    desc: str(it.desc, 2000),
+    price: Math.max(0, Math.round(num(it.price))),
+  })).filter((it) => it.desc || it.qty || it.price);
+  const discountType = b.discountType === 'amt' ? 'amt' : 'pct';
+  const discountValue = Math.max(0, num(b.discountValue));
+  const ivaRate = Math.min(Math.max(num(b.ivaRate ?? IVA_DEFAULT), 0), 100);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(b.date || '') ? b.date : new Date().toISOString().slice(0, 10);
+  return {
+    client: {
+      company: str(b.client?.company, 150), contact: str(b.client?.contact, 150), rut: str(b.client?.rut, 20),
+      phone: str(b.client?.phone, 40), email: str(b.client?.email, 150), address: str(b.client?.address, 300),
+    },
+    date, validDays: Math.min(Math.max(Math.round(num(b.validDays) || 15), 1), 365),
+    items, discountType, discountValue, ivaRate, notes: str(b.notes, 4000),
+    totals: computeTotals(items, discountType, discountValue, ivaRate),
+  };
+}
+
+function rowToQuote(r, full = false) {
+  const q = {
+    id: r.id, number: r.number, date: r.quote_date, total: r.total, hasPdf: r.pdf_size > 0, pdfSize: r.pdf_size,
+    client: { company: r.client_company, contact: r.client_contact, rut: r.client_rut, phone: r.client_phone, email: r.client_email, address: r.client_address },
+    updatedAt: r.updated_at,
+  };
+  if (full) Object.assign(q, {
+    validDays: r.valid_days, items: JSON.parse(r.items_json || '[]'), discountType: r.discount_type,
+    discountValue: r.discount_value, ivaRate: r.iva_rate, notes: r.notes,
+    totals: { subtotal: r.subtotal, discount: r.discount_amount, net: r.net, iva: r.iva, total: r.total },
+  });
+  return q;
+}
+
+async function readJson(req) {
+  const len = Number(req.headers.get('Content-Length') || 0);
+  if (len > MAX_JSON) throw new Error('too_big');
+  const t = await req.text();
+  if (t.length > MAX_JSON) throw new Error('too_big');
+  return t ? JSON.parse(t) : {};
+}
+
+// ---------- sesión ----------
+async function currentUser(req, db) {
+  const t = cookie(req, 'cot_s');
+  if (!t || !/^[a-f0-9]{64}$/.test(t)) return null;
+  const row = await db.prepare(
+    'SELECT u.id, u.name, s.expires_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?'
+  ).bind(await sha256(t)).first();
+  if (!row || row.expires_at < Date.now()) return null;
+  return { id: row.id, name: row.name };
+}
+
+async function createSession(db, userId) {
+  const token = randomHex(32);
+  await db.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(Date.now()).run();
+  await db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
+    .bind(await sha256(token), userId, Date.now() + SESSION_DAYS * 864e5).run();
+  return sessionCookie(token, SESSION_DAYS * 86400);
+}
+
+// Bloqueo: 5 intentos fallidos por nombre+IP → 15 min; 10 por nombre (cualquier IP) → 1 hora.
+async function checkLock(db, keys) {
+  const now = Date.now();
+  for (const k of keys) {
+    const r = await db.prepare('SELECT locked_until FROM login_attempts WHERE k = ?').bind(k).first();
+    if (r && r.locked_until > now) return Math.ceil((r.locked_until - now) / 60000);
+  }
+  return 0;
+}
+async function registerFail(db, k, limit, lockMs) {
+  const r = await db.prepare('SELECT fails FROM login_attempts WHERE k = ?').bind(k).first();
+  const fails = (r?.fails || 0) + 1;
+  const lockedUntil = fails >= limit ? Date.now() + lockMs : 0;
+  await db.prepare(
+    'INSERT INTO login_attempts (k, fails, locked_until) VALUES (?, ?, ?) ON CONFLICT(k) DO UPDATE SET fails = ?, locked_until = ?'
+  ).bind(k, fails >= limit ? 0 : fails, lockedUntil, fails >= limit ? 0 : fails, lockedUntil).run();
+}
+
+// ---------- API ----------
+async function api(req, env, url) {
+  const db = env.DB;
+  if (!db) return err('Falta conectar la base de datos D1 (binding "DB") en Cloudflare.', 500);
+  await ensureSchema(db);
+
+  const path = url.pathname.replace(/^\/api/, '');
+  const method = req.method;
+
+  // Protección CSRF: toda escritura debe venir de esta misma página.
+  if (method !== 'GET' && req.headers.get('X-Cotizador') !== '1') return err('Solicitud no válida', 403);
+
+  if (path === '/status' && method === 'GET') {
+    const n = await db.prepare('SELECT COUNT(*) AS n FROM users').first();
+    const user = await currentUser(req, db);
+    return json({ needsSetup: n.n === 0, setupEnabled: !!env.SETUP_KEY, user });
+  }
+
+  if (path === '/setup' && method === 'POST') {
+    const b = await readJson(req);
+    const n = await db.prepare('SELECT COUNT(*) AS n FROM users').first();
+    if (n.n > 0) return err('La cuenta inicial ya existe.', 409);
+    if (!env.SETUP_KEY) return err('Falta la variable SETUP_KEY en Cloudflare.', 500);
+    const ip = req.headers.get('CF-Connecting-IP') || 'x';
+    const mins = await checkLock(db, ['setup:' + ip]);
+    if (mins) return err(`Demasiados intentos. Espera ${mins} min.`, 429);
+    if (!safeEqual(await sha256(String(b.setupKey || '')), await sha256(env.SETUP_KEY))) {
+      await registerFail(db, 'setup:' + ip, 5, 15 * 60000);
+      return err('La clave de instalación no es correcta.', 401);
+    }
+    if (!validName(b.name) || !validPin(b.pin)) return err('Nombre (2 a 40 letras) y PIN de 4 números.');
+    const salt = randomHex(16);
+    const r = await db.prepare('INSERT INTO users (name, pin_hash, salt) VALUES (?, ?, ?) RETURNING id')
+      .bind(b.name.trim(), await hashPin(b.pin, salt), salt).first();
+    return json({ ok: true, user: { id: r.id, name: b.name.trim() } }, 200, { 'Set-Cookie': await createSession(db, r.id) });
+  }
+
+  if (path === '/login' && method === 'POST') {
+    const b = await readJson(req);
+    const name = str(b.name, 40).toLowerCase();
+    if (!name || !validPin(b.pin)) return err('Escribe tu nombre y un PIN de 4 números.');
+    const ip = req.headers.get('CF-Connecting-IP') || 'x';
+    const kIp = `ip:${ip}:${name}`, kName = `name:${name}`;
+    const mins = await checkLock(db, [kIp, kName]);
+    if (mins) return err(`Demasiados intentos. Espera ${mins} min.`, 429);
+    const u = await db.prepare('SELECT id, name, pin_hash, salt FROM users WHERE name = ? COLLATE NOCASE').bind(name).first();
+    const h = await hashPin(b.pin, u ? u.salt : 'nouser-salt');
+    if (!u || !safeEqual(h, u.pin_hash)) {
+      await registerFail(db, kIp, 5, 15 * 60000);
+      await registerFail(db, kName, 10, 60 * 60000);
+      return err('Nombre o PIN incorrecto.', 401);
+    }
+    await db.prepare('DELETE FROM login_attempts WHERE k IN (?, ?)').bind(kIp, kName).run();
+    return json({ ok: true, user: { id: u.id, name: u.name } }, 200, { 'Set-Cookie': await createSession(db, u.id) });
+  }
+
+  if (path === '/logout' && method === 'POST') {
+    const t = cookie(req, 'cot_s');
+    if (t) await db.prepare('DELETE FROM sessions WHERE token_hash = ?').bind(await sha256(t)).run();
+    return json({ ok: true }, 200, { 'Set-Cookie': sessionCookie('', 0) });
+  }
+
+  // ----- desde aquí, todo requiere sesión -----
+  const user = await currentUser(req, db);
+  if (!user) return err('Sesión expirada. Vuelve a entrar.', 401);
+
+  if (path === '/settings') {
+    if (method === 'GET') {
+      const r = await db.prepare("SELECT v FROM settings WHERE k = 'company'").first();
+      return json(r ? JSON.parse(r.v) : {});
+    }
+    if (method === 'PUT') {
+      const b = await readJson(req);
+      const logo = typeof b.logo === 'string' && /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(b.logo) && b.logo.length < 900_000 ? b.logo : '';
+      const s = {
+        tradeName: str(b.tradeName, 100), legalName: str(b.legalName, 150), rut: str(b.rut, 20), giro: str(b.giro, 200),
+        address: str(b.address, 300), phone: str(b.phone, 60), email: str(b.email, 150), web: str(b.web, 150),
+        seller: str(b.seller, 100), bank: str(b.bank, 1000), conditions: str(b.conditions, 3000),
+        ivaRate: Math.min(Math.max(num(b.ivaRate ?? IVA_DEFAULT), 0), 100), validDays: Math.round(num(b.validDays) || 15), logo, configured: true,
+      };
+      await db.prepare("INSERT INTO settings (k, v) VALUES ('company', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v")
+        .bind(JSON.stringify(s)).run();
+      return json({ ok: true });
+    }
+  }
+
+  if (path === '/pin' && method === 'POST') {
+    const b = await readJson(req);
+    if (!validPin(b.current) || !validPin(b.next)) return err('Los PIN deben tener 4 números.');
+    const u = await db.prepare('SELECT pin_hash, salt FROM users WHERE id = ?').bind(user.id).first();
+    if (!safeEqual(await hashPin(b.current, u.salt), u.pin_hash)) return err('El PIN actual no es correcto.', 401);
+    const salt = randomHex(16);
+    await db.prepare('UPDATE users SET pin_hash = ?, salt = ? WHERE id = ?').bind(await hashPin(b.next, salt), salt, user.id).run();
+    return json({ ok: true });
+  }
+
+  if (path === '/users') {
+    if (method === 'GET') {
+      const r = await db.prepare('SELECT id, name, created_at FROM users ORDER BY id').all();
+      return json(r.results);
+    }
+    if (method === 'POST') {
+      const b = await readJson(req);
+      if (!validName(b.name) || !validPin(b.pin)) return err('Nombre (2 a 40 letras) y PIN de 4 números.');
+      const exists = await db.prepare('SELECT id FROM users WHERE name = ? COLLATE NOCASE').bind(b.name.trim()).first();
+      if (exists) return err('Ya existe una cuenta con ese nombre.', 409);
+      const salt = randomHex(16);
+      await db.prepare('INSERT INTO users (name, pin_hash, salt) VALUES (?, ?, ?)').bind(b.name.trim(), await hashPin(b.pin, salt), salt).run();
+      return json({ ok: true });
+    }
+  }
+  let m = path.match(/^\/users\/(\d+)$/);
+  if (m && method === 'DELETE') {
+    const id = Number(m[1]);
+    if (id === user.id) return err('No puedes borrar tu propia cuenta.');
+    await db.batch([
+      db.prepare('DELETE FROM sessions WHERE user_id = ?').bind(id),
+      db.prepare('DELETE FROM users WHERE id = ?').bind(id),
+    ]);
+    return json({ ok: true });
+  }
+
+  if (path === '/quotes') {
+    if (method === 'GET') {
+      const q = str(url.searchParams.get('q') || '', 100);
+      const cols = 'id, number, client_company, client_contact, client_rut, client_phone, client_email, client_address, quote_date, total, pdf_size, updated_at';
+      let r;
+      if (q) {
+        const like = '%' + q.replace(/[%_\\]/g, (c) => '\\' + c) + '%';
+        const numQ = /^\d+$/.test(q) ? Number(q) : -1;
+        r = await db.prepare(
+          `SELECT ${cols} FROM quotes WHERE client_company LIKE ?1 ESCAPE '\\' OR client_contact LIKE ?1 ESCAPE '\\' OR client_rut LIKE ?1 ESCAPE '\\' OR number = ?2
+           ORDER BY number DESC LIMIT 200`).bind(like, numQ).all();
+      } else {
+        r = await db.prepare(`SELECT ${cols} FROM quotes ORDER BY number DESC LIMIT 200`).all();
+      }
+      return json(r.results.map((x) => rowToQuote(x)));
+    }
+    if (method === 'POST') {
+      const s = sanitizeQuote(await readJson(req));
+      const r = await db.prepare(
+        `INSERT INTO quotes (number, client_company, client_contact, client_rut, client_phone, client_email, client_address,
+           quote_date, valid_days, items_json, discount_type, discount_value, iva_rate, notes,
+           subtotal, discount_amount, net, iva, total, created_by)
+         VALUES ((SELECT COALESCE(MAX(number), 0) + 1 FROM quotes), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         RETURNING id, number`
+      ).bind(s.client.company, s.client.contact, s.client.rut, s.client.phone, s.client.email, s.client.address,
+        s.date, s.validDays, JSON.stringify(s.items), s.discountType, s.discountValue, s.ivaRate, s.notes,
+        s.totals.subtotal, s.totals.discount, s.totals.net, s.totals.iva, s.totals.total, user.id).first();
+      return json({ id: r.id, number: r.number, totals: s.totals });
+    }
+  }
+
+  m = path.match(/^\/quotes\/(\d+)(\/pdf)?$/);
+  if (m) {
+    const id = Number(m[1]);
+    if (m[2]) {
+      if (method === 'GET') {
+        const r = await db.prepare('SELECT number, client_company, pdf FROM quotes WHERE id = ?').bind(id).first();
+        if (!r || !r.pdf) return err('Esta cotización no tiene PDF guardado.', 404);
+        const bytes = r.pdf instanceof ArrayBuffer ? r.pdf : new Uint8Array(r.pdf).buffer;
+        const fname = `Cotizacion-${String(r.number).padStart(4, '0')}.pdf`;
+        const dl = url.searchParams.get('dl') === '1';
+        return new Response(bytes, { headers: {
+          'Content-Type': 'application/pdf', 'Cache-Control': 'private, no-store',
+          'Content-Disposition': `${dl ? 'attachment' : 'inline'}; filename="${fname}"`, ...SEC_HEADERS,
+          'Content-Security-Policy': "default-src 'none'; frame-ancestors 'self'",
+          'X-Frame-Options': 'SAMEORIGIN',
+        } });
+      }
+      if (method === 'PUT') {
+        const len = Number(req.headers.get('Content-Length') || 0);
+        if (len > MAX_PDF) return err('El PDF pesa demasiado (máx. 1,9 MB). Usa una imagen más liviana.', 413);
+        const buf = await req.arrayBuffer();
+        if (buf.byteLength > MAX_PDF) return err('El PDF pesa demasiado (máx. 1,9 MB). Usa una imagen más liviana.', 413);
+        const head = new TextDecoder().decode(buf.slice(0, 5));
+        if (head !== '%PDF-') return err('El archivo no es un PDF.');
+        const r = await db.prepare("UPDATE quotes SET pdf = ?, pdf_size = ?, updated_at = datetime('now') WHERE id = ?")
+          .bind(buf, buf.byteLength, id).run();
+        if (!r.meta.changes) return err('No existe esa cotización.', 404);
+        return json({ ok: true, size: buf.byteLength });
+      }
+    }
+    if (method === 'GET') {
+      const r = await db.prepare('SELECT * FROM quotes WHERE id = ?').bind(id).first();
+      if (!r) return err('No existe esa cotización.', 404);
+      delete r.pdf;
+      return json(rowToQuote(r, true));
+    }
+    if (method === 'PUT') {
+      const s = sanitizeQuote(await readJson(req));
+      const r = await db.prepare(
+        `UPDATE quotes SET client_company=?, client_contact=?, client_rut=?, client_phone=?, client_email=?, client_address=?,
+           quote_date=?, valid_days=?, items_json=?, discount_type=?, discount_value=?, iva_rate=?, notes=?,
+           subtotal=?, discount_amount=?, net=?, iva=?, total=?, updated_at=datetime('now') WHERE id=? RETURNING id, number`
+      ).bind(s.client.company, s.client.contact, s.client.rut, s.client.phone, s.client.email, s.client.address,
+        s.date, s.validDays, JSON.stringify(s.items), s.discountType, s.discountValue, s.ivaRate, s.notes,
+        s.totals.subtotal, s.totals.discount, s.totals.net, s.totals.iva, s.totals.total, id).first();
+      if (!r) return err('No existe esa cotización.', 404);
+      return json({ id: r.id, number: r.number, totals: s.totals });
+    }
+    if (method === 'DELETE') {
+      await db.prepare('DELETE FROM quotes WHERE id = ?').bind(id).run();
+      return json({ ok: true });
+    }
+  }
+
+  return err('No encontrado', 404);
+}
+
+export default {
+  async fetch(req, env) {
+    const url = new URL(req.url);
+    if (url.pathname.startsWith('/api/')) {
+      try { return await api(req, env, url); }
+      catch (e) {
+        if (e && e.message === 'too_big') return err('Los datos pesan demasiado.', 413);
+        if (e instanceof SyntaxError) return err('Datos mal formados.');
+        console.error(e);
+        return err('Error del servidor. Intenta de nuevo.', 500);
+      }
+    }
+    if (url.pathname === '/_worker.js' || url.pathname.startsWith('/_')) return new Response('No encontrado', { status: 404 });
+    return withSec(await env.ASSETS.fetch(req));
+  },
+};
