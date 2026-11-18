@@ -1,0 +1,16 @@
+{
+  // Configuración para Cloudflare Workers (Workers & Pages → conectar repo).
+  // "name" debe ser igual al nombre del Worker en el panel de Cloudflare.
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cotizacionesprotoldos",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-11-17",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    // El servidor responde primero para agregar las cabeceras de seguridad a todo.
+    "run_worker_first": true
+  },
+  "observability": { "enabled": true }
+  // Secretos (se configuran en el panel, no aquí): DATABASE_URL y SETUP_KEY
+}

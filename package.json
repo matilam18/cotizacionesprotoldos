@@ -1,0 +1,15 @@
+{
+  "name": "cotizaciones-protoldos",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/worker.js --bundle --format=esm --platform=browser --conditions=workerd,worker,browser --target=es2022 --legal-comments=none --outfile=public/_worker.js"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.2.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "wrangler": "^4.164.0"
+  }
+}
