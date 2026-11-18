@@ -669,6 +669,7 @@ async function loadList() {
         ${r.hasPdf ? `<button class="btn line sm" data-act="pdf" data-id="${r.id}" data-n="${r.number}" data-c="${esc(r.client.company)}">Ver PDF</button>
         <a class="btn line sm" href="/api/quotes/${r.id}/pdf?dl=1">Descargar</a>` : ''}
         <button class="btn line sm" data-act="edit" data-id="${r.id}">Editar</button>
+        <button class="btn line sm" data-act="same" data-id="${r.id}">Nueva para esta empresa</button>
         <button class="btn line sm danger" data-act="del" data-id="${r.id}" data-n="${r.number}">Eliminar</button>
       </div></article>`).join('');
   } catch (e) { box.innerHTML = `<p class="empty">${esc(e.message)}</p>`; }
@@ -676,6 +677,18 @@ async function loadList() {
 $('#list').addEventListener('click', async (e) => {
   const b = e.target.closest('[data-act]'); if (!b) return;
   const id = b.dataset.id;
+  if (b.dataset.act === 'same') {
+    if (isDirty() && !confirm('Tienes cambios sin guardar en el editor. ¿Empezar una cotización nueva de todas formas?')) return;
+    try {
+      const q = await api('GET', '/quotes/' + id);
+      newQuote();
+      for (const [idd, k] of Object.entries(CLIENT_IDS)) $('#' + idd).value = q.client[k] || '';
+      savedSnapshot = snapshot();
+      showView('editor');
+      toast(`Nueva cotización para ${q.client.company || 'este cliente'}`);
+      $('#items .item textarea')?.focus();
+    } catch (er) { toast(er.message, true); }
+  }
   if (b.dataset.act === 'edit') {
     if (isDirty() && !confirm('Tienes cambios sin guardar en el editor. ¿Abrir esta cotización de todas formas?')) return;
     openQuote(id);
